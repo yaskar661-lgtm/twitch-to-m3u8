@@ -1,9 +1,23 @@
 import time
 import requests
-from flask import Flask, Response, request, abort
+import logging
 import os
+from flask import Flask, Response, request, abort
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+# Loglama ayarları
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 app = Flask(__name__)
+
+# Rate Limiter Kurulumu (1 saniyede / dakikada aşırı istek gelmesini engellemek için)
+# Render arkasında çalıştığı için get_remote_address fonksiyonu X-Forwarded-For başlığını dikkate alır.
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per minute"] # Genel bir sınır
+)
 
 # Bellek içi cache: { channel_name: {"urls": {...}, "expires_at": timestamp} }
 STREAM_CACHE = {}
@@ -32,9 +46,10 @@ def fetch_twitch_master_data(channel: str, force_refresh: bool = False):
                     "urls": urls,
                     "expires_at": now + CACHE_TTL
                 }
+                logging.info(f"Başarılı: '{channel_key}' için taze linkler alındı ve önbelleklendi.")
                 return urls
     except Exception as e:
-        print(f"API Hatası: {e}")
+        logging.error(f"API Hatası ({channel_key}): {e}")
         
     return None
 
@@ -76,6 +91,7 @@ def clean_twitch_manifest(m3u8_content: str) -> str:
 
 
 @app.route("/stream/<channel>.m3u8")
+@limiter.limit("30 per minute") # Kanal başı/IP başı master istek sınırı
 def master_playlist(channel):
     urls = fetch_twitch_master_data(channel)
     if not urls:
@@ -100,6 +116,7 @@ def master_playlist(channel):
 
 
 @app.route("/stream/media/<channel>/<quality>.m3u8")
+@limiter.limit("120 per minute") # Video oynatıcılar segmentleri sık çekeceği için limiti biraz daha esnek tutuyoruz
 def media_playlist(channel, quality):
     urls = fetch_twitch_master_data(channel)
     if not urls or quality not in urls:
@@ -113,13 +130,14 @@ def media_playlist(channel, quality):
             raw_content = resp.text
             cleaned_content = clean_twitch_manifest(raw_content)
             return Response(cleaned_content, content_type="application/vnd.apple.mpegurl")
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"Media Playlist Çekme Hatası: {e}")
         
     return abort(500, description="Media playlist yüklenemedi.")
 
 
 @app.route("/stream/refresh/<channel>")
+@limiter.limit("5 per minute") # Manuel tazeleme suistimalini önlemek için sıkı tutuldu
 def restart_channel(channel):
     channel_key = channel.lower()
     
@@ -135,6 +153,7 @@ def restart_channel(channel):
     else:
         return f"Hata: '{channel}' kanalı şu an çevrimdışı veya taze link alınamadı.", 400
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
